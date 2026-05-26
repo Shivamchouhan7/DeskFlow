@@ -1,164 +1,142 @@
 const express = require('express');
-const router  = express.Router();
-const Ticket  = require('../models/Ticket');
+const router = express.Router();
+const supabase = require('../supabaseClient');
 
-/*
-  Builds the plain response object for a ticket.
-  We call virtuals explicitly here because some Mongoose versions
-  don't include them by default when serializing inside an array.
-*/
-function buildTicketResponse(ticket) {
+const SLA_TARGETS = {
+  urgent: 60,
+  high: 240,
+  medium: 1440,
+  low: 4320,
+};
+
+const STATUS_ORDER = { open: 0, in_progress: 1, resolved: 2, closed: 3 };
+
+function validateTransition(current, next) {
+  const from = STATUS_ORDER[current];
+  const to = STATUS_ORDER[next];
+  if (from === undefined || to === undefined) return { valid: false, error: 'Unknown status' };
+  const delta = to - from;
+  if (delta === 0) return { valid: false, error: 'Already in that status' };
+  if (Math.abs(delta) === 1) return { valid: true };
+  return { valid: false, error: 'Only one step at a time allowed' };
+}
+
+function processTicket(t) {
+  // Convert Supabase row to expected frontend format
+  const createdAt = new Date(t.created_at);
+  const resolvedAt = t.resolved_at ? new Date(t.resolved_at) : null;
+  
+  const referencePoint = ((t.status === 'resolved' || t.status === 'closed') && resolvedAt) 
+    ? resolvedAt 
+    : new Date();
+  
+  const ageMinutes = Math.floor((referencePoint - createdAt) / 60000);
+  const slaBreached = ageMinutes > (SLA_TARGETS[t.priority] || 99999);
+
   return {
-    _id:           ticket._id,
-    subject:       ticket.subject,
-    description:   ticket.description,
-    customerEmail: ticket.customerEmail,
-    priority:      ticket.priority,
-    status:        ticket.status,
-    createdAt:     ticket.createdAt,
-    resolvedAt:    ticket.resolvedAt || null,
-    ageMinutes:    ticket.ageMinutes,
-    slaBreached:   ticket.slaBreached,
+    _id: t.id,
+    subject: t.subject,
+    description: t.description,
+    customerEmail: t.customer_email,
+    priority: t.priority,
+    status: t.status,
+    createdAt: t.created_at,
+    resolvedAt: t.resolved_at,
+    ageMinutes,
+    slaBreached
   };
 }
 
 // GET /tickets/stats
-// Must be declared before /:id so Express doesn't treat "stats" as a Mongo ID
 router.get('/stats', async (req, res) => {
-  try {
-    const all = await Ticket.find({});
+  const { data: tickets, error } = await supabase.from('tickets').select('*');
+  if (error) return res.status(500).json({ error: error.message });
+  
+  const processed = tickets.map(processTicket);
+  const byStatus = { open: 0, in_progress: 0, resolved: 0, closed: 0 };
+  const byPriority = { low: 0, medium: 0, high: 0, urgent: 0 };
+  let slaBreachedOpen = 0;
 
-    const byStatus   = { open: 0, in_progress: 0, resolved: 0, closed: 0 };
-    const byPriority = { low: 0, medium: 0, high: 0, urgent: 0 };
-    let breachedAndOpen = 0;
-
-    for (const t of all) {
-      if (byStatus[t.status]     !== undefined) byStatus[t.status]++;
-      if (byPriority[t.priority] !== undefined) byPriority[t.priority]++;
-
-      // Only count breaches on tickets that are still being worked on
-      const stillActive = t.status === 'open' || t.status === 'in_progress';
-      if (t.slaBreached && stillActive) breachedAndOpen++;
-    }
-
-    res.json({ byStatus, byPriority, slaBreachedOpen: breachedAndOpen, total: all.length });
-  } catch (err) {
-    console.error('[stats]', err.message);
-    res.status(500).json({ error: 'Could not fetch stats' });
+  for (const t of processed) {
+    if (byStatus[t.status] !== undefined) byStatus[t.status]++;
+    if (byPriority[t.priority] !== undefined) byPriority[t.priority]++;
+    if (t.slaBreached && (t.status === 'open' || t.status === 'in_progress')) slaBreachedOpen++;
   }
+
+  res.json({ byStatus, byPriority, slaBreachedOpen, total: processed.length });
 });
 
 // POST /tickets
 router.post('/', async (req, res) => {
-  try {
-    const { subject, description, customerEmail, priority } = req.body;
+  const { subject, description, customerEmail, priority } = req.body;
+  const missing = ['subject', 'description', 'customerEmail', 'priority'].filter(f => !req.body[f]);
+  if (missing.length) return res.status(400).json({ error: `Missing: ${missing.join(', ')}` });
 
-    // Collect missing fields before hitting Mongoose so we return a helpful message
-    const missing = ['subject', 'description', 'customerEmail', 'priority'].filter(
-      (f) => !req.body[f]
-    );
-    if (missing.length) {
-      return res.status(400).json({ error: `Missing required fields: ${missing.join(', ')}` });
-    }
+  const { data, error } = await supabase.from('tickets').insert([{
+    subject,
+    description,
+    customer_email: customerEmail,
+    priority
+  }]).select().single();
 
-    const ticket = await new Ticket({ subject, description, customerEmail, priority }).save();
-    res.status(201).json(buildTicketResponse(ticket));
-  } catch (err) {
-    if (err.name === 'ValidationError') {
-      const msg = Object.values(err.errors).map((e) => e.message).join('; ');
-      return res.status(400).json({ error: msg });
-    }
-    console.error('[POST /tickets]', err.message);
-    res.status(500).json({ error: 'Failed to create ticket' });
-  }
+  if (error) return res.status(400).json({ error: error.message });
+  res.status(201).json(processTicket(data));
 });
 
-// GET /tickets  — supports ?status, ?priority, ?breached=true (combinable)
+// GET /tickets
 router.get('/', async (req, res) => {
-  try {
-    const query = {};
+  let query = supabase.from('tickets').select('*').order('created_at', { ascending: false });
+  
+  if (req.query.status) query = query.eq('status', req.query.status);
+  if (req.query.priority) query = query.eq('priority', req.query.priority);
 
-    const allowedStatuses   = ['open', 'in_progress', 'resolved', 'closed'];
-    const allowedPriorities = ['low', 'medium', 'high', 'urgent'];
+  const { data: tickets, error } = await query;
+  if (error) return res.status(500).json({ error: error.message });
 
-    if (req.query.status) {
-      if (!allowedStatuses.includes(req.query.status)) {
-        return res.status(400).json({ error: `Invalid status: ${req.query.status}` });
-      }
-      query.status = req.query.status;
-    }
-
-    if (req.query.priority) {
-      if (!allowedPriorities.includes(req.query.priority)) {
-        return res.status(400).json({ error: `Invalid priority: ${req.query.priority}` });
-      }
-      query.priority = req.query.priority;
-    }
-
-    let tickets = (await Ticket.find(query).sort({ createdAt: -1 })).map(buildTicketResponse);
-
-    // breached filter is applied after fetch because slaBreached is a derived virtual,
-    // not a stored field — we can't query it from MongoDB directly
-    if (req.query.breached === 'true') {
-      tickets = tickets.filter((t) => t.slaBreached);
-    }
-
-    res.json(tickets);
-  } catch (err) {
-    console.error('[GET /tickets]', err.message);
-    res.status(500).json({ error: 'Failed to fetch tickets' });
-  }
+  let result = tickets.map(processTicket);
+  if (req.query.breached === 'true') result = result.filter(t => t.slaBreached);
+  
+  res.json(result);
 });
 
 // PATCH /tickets/:id
 router.patch('/:id', async (req, res) => {
-  try {
-    const ticket = await Ticket.findById(req.params.id);
-    if (!ticket) return res.status(404).json({ error: 'Ticket not found' });
+  const { data: ticket, error: fetchErr } = await supabase.from('tickets').select('*').eq('id', req.params.id).single();
+  if (fetchErr || !ticket) return res.status(404).json({ error: 'Ticket not found' });
 
-    const { status, subject, description, customerEmail, priority } = req.body;
+  const updates = {};
+  const { status, subject, description, customerEmail, priority } = req.body;
 
-    if (status && status !== ticket.status) {
-      const check = Ticket.validateTransition(ticket.status, status);
-      if (!check.valid) return res.status(400).json({ error: check.error });
+  if (status && status !== ticket.status) {
+    const check = validateTransition(ticket.status, status);
+    if (!check.valid) return res.status(400).json({ error: check.error });
 
-      // Moving into resolved: record the timestamp
-      if (status === 'resolved') ticket.resolvedAt = new Date();
-
-      // Rolling back from resolved: wipe the timestamp so ageMinutes resumes growing
-      if (ticket.status === 'resolved' && status !== 'resolved') ticket.resolvedAt = null;
-
-      ticket.status = status;
-    }
-
-    if (subject       !== undefined) ticket.subject       = subject;
-    if (description   !== undefined) ticket.description   = description;
-    if (customerEmail !== undefined) ticket.customerEmail = customerEmail;
-    if (priority      !== undefined) ticket.priority      = priority;
-
-    await ticket.save();
-    res.json(buildTicketResponse(ticket));
-  } catch (err) {
-    if (err.name === 'ValidationError') {
-      return res.status(400).json({ error: Object.values(err.errors).map((e) => e.message).join('; ') });
-    }
-    if (err.name === 'CastError') return res.status(400).json({ error: 'Invalid ticket ID format' });
-    console.error('[PATCH /tickets/:id]', err.message);
-    res.status(500).json({ error: 'Failed to update ticket' });
+    updates.status = status;
+    if (status === 'resolved') updates.resolved_at = new Date().toISOString();
+    if (ticket.status === 'resolved' && status !== 'resolved') updates.resolved_at = null;
   }
+
+  if (subject !== undefined) updates.subject = subject;
+  if (description !== undefined) updates.description = description;
+  if (customerEmail !== undefined) updates.customer_email = customerEmail;
+  if (priority !== undefined) updates.priority = priority;
+
+  const { data: updated, error: updateErr } = await supabase
+    .from('tickets')
+    .update(updates)
+    .eq('id', req.params.id)
+    .select()
+    .single();
+
+  if (updateErr) return res.status(400).json({ error: updateErr.message });
+  res.json(processTicket(updated));
 });
 
 // DELETE /tickets/:id
 router.delete('/:id', async (req, res) => {
-  try {
-    const removed = await Ticket.findByIdAndDelete(req.params.id);
-    if (!removed) return res.status(404).json({ error: 'Ticket not found' });
-    res.json({ message: 'Ticket removed' });
-  } catch (err) {
-    if (err.name === 'CastError') return res.status(400).json({ error: 'Invalid ticket ID format' });
-    console.error('[DELETE /tickets/:id]', err.message);
-    res.status(500).json({ error: 'Failed to delete ticket' });
-  }
+  const { error } = await supabase.from('tickets').delete().eq('id', req.params.id);
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ message: 'Ticket removed' });
 });
 
 module.exports = router;
