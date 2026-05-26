@@ -11,6 +11,8 @@ app.use(express.json());
 
 app.use('/tickets', ticketRouter);
 
+app.get('/', (_req, res) => res.json({ message: 'Welcome to the DeskFlow API!' }));
+
 app.get('/health', (_req, res) => res.json({ ok: true }));
 
 app.use((_req, res) => res.status(404).json({ error: 'Not found' }));
