@@ -1,4 +1,4 @@
-const BASE = '';
+const BASE = import.meta.env.DEV ? '' : 'https://deskflow-uc1r.onrender.com';
 
 async function request(method, path, body) {
   const opts = {
